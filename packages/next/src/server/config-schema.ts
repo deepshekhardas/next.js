@@ -380,6 +380,14 @@ export const experimentalSchema = {
   turbopackRemoveUnusedImports: z.boolean().optional(),
   turbopackRemoveUnusedExports: z.boolean().optional(),
   turbopackScopeHoisting: z.boolean().optional(),
+  chunkingHeuristics: z
+    .object({
+      clusters: z.array(z.array(z.string())).optional(),
+      bounceRate: z.number().min(0).max(1).optional(),
+      commonEntryPoints: z.array(z.string()).optional(),
+      estimatedRequestCost: z.number().min(0).max(1_000_000).optional(),
+    })
+    .optional(),
   turbopackWorkerAssetPrefix: z.string().optional(),
   turbopackClientSideNestedAsyncChunking: z.boolean().optional(),
   turbopackServerSideNestedAsyncChunking: z.boolean().optional(),

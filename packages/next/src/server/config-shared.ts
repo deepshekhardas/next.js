@@ -746,6 +746,26 @@ export interface ExperimentalConfig {
   turbopackScopeHoisting?: boolean
 
   /**
+   * (`next --turbopack` only) Traffic-related hints for the production chunker. These change the
+   * assumptions Turbopack makes when making chunk merging decisions.
+   *
+   * - `clusters`: groups of pages commonly visited together, each defined by a list of wildcard
+   *   route patterns (`*` matches within a path segment, `**` across segments).
+   * - `bounceRate`: a number in `0..1`. Used at two-decimal (integer-percent) resolution.
+   * - `commonEntryPoints`: routes that are entry points and should be grouped more eagerly to
+   *   reduce the single-route request cost (e.g. the homepage).
+   * - `estimatedRequestCost`: estimated cost of an additional request, in bytes (uncompressed
+   *   bytes of code, default is 200 KB, max 1 MB), used by the chunker to trade off request count
+   *   against preventing double-fetching.
+   */
+  chunkingHeuristics?: {
+    clusters?: string[][]
+    bounceRate?: number
+    commonEntryPoints?: string[]
+    estimatedRequestCost?: number
+  }
+
+  /**
    * (`next --turbopack` only) A custom URL prefix for Web Worker URLs
    * produced by `new Worker(new URL(..., import.meta.url))` — both the
    * entrypoint URL and the module chunks loaded inside the worker —
