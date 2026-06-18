@@ -26,7 +26,7 @@ use turbopack_core::{
     issue::{
         IgnoreIssue, IgnoreIssuePattern, Issue, IssueExt, IssueSeverity, IssueStage, StyledString,
     },
-    module_graph::style_groups::StyleGroupsAlgorithm,
+    module_graph::{chunk_group_info::EntryHeuristics, style_groups::StyleGroupsAlgorithm},
     resolve::ResolveAliasMap,
 };
 use turbopack_ecmascript::{
@@ -1131,6 +1131,83 @@ const DEFAULT_REQUEST_COST: f32 = 20_000.0;
 /// Default `moduleFactorCost` for the graph algorithm.
 const DEFAULT_MODULE_FACTOR_COST: f32 = 1.0;
 
+/// `experimental.chunkingHeuristics`: hints for Turbopack's production chunker.
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Deserialize,
+    TraceRawVcs,
+    NonLocalValue,
+    OperationValue,
+    Encode,
+    Decode,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkingHeuristicsConfig {
+    /// Groups of pages commonly visited together, each defined by a list of wildcard route
+    /// patterns. The cluster ID is the index in this list.
+    clusters: Option<Vec<Vec<RcStr>>>,
+    /// Global bounce rate in `0.0..=1.0`.
+    bounce_rate: Option<f64>,
+    /// Route patterns for routes that are entry points and should be grouped
+    /// more eagerly to reduce the single-route request cost (e.g. the homepage).
+    common_entry_points: Option<Vec<RcStr>>,
+    /// Estimated cost of an additional request, in bytes (uncompressed bytes of code,
+    /// default is 200 KB), used by the chunker to trade off request count against
+    /// preventing double-fetching.
+    estimated_request_cost: Option<f64>,
+}
+
+#[turbo_tasks::value]
+pub struct ChunkingHeuristics {
+    /// One entry per cluster: the route-pattern globs that define it. Cluster id = index.
+    clusters: Vec<Vec<Glob>>,
+    /// Global bounce rate as an integer percentage (`0..=100`), or `None` if unset.
+    bounce_rate_percent: Option<u32>,
+    /// Route-pattern globs for common entry points.
+    common_entry_points: Vec<Glob>,
+    /// Global estimated cost of an additional request, in bytes, or `None` if unset.
+    estimated_request_cost: Option<u64>,
+}
+
+impl ChunkingHeuristics {
+    /// Compute the [`EntryHeuristics`] for a route `pathname` by matching it against the configured
+    /// cluster and common-entry-point route-pattern globs.
+    pub fn entry_heuristics_for(&self, pathname: &str) -> EntryHeuristics {
+        let clusters = self
+            .clusters
+            .iter()
+            .enumerate()
+            .filter(|(_, globs)| globs.iter().any(|glob| glob.matches(pathname)))
+            .map(|(index, _)| index as u32)
+            .collect();
+        let common_entry_point = self
+            .common_entry_points
+            .iter()
+            .any(|glob| glob.matches(pathname));
+        EntryHeuristics {
+            clusters,
+            common_entry_point,
+            bounce_rate_percent: self.bounce_rate_percent,
+            estimated_request_cost: self.estimated_request_cost,
+        }
+    }
+}
+
+/// Compile a list of wildcard route patterns into [`Glob`]s for matching against route pathnames.
+fn parse_route_globs(patterns: &[RcStr]) -> Result<Vec<Glob>> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            Glob::parse(pattern.clone(), GlobOptions::default()).with_context(|| {
+                format!("Invalid route pattern in `experimental.chunkingHeuristics`: {pattern}")
+            })
+        })
+        .collect()
+}
+
 /// Resolve `experimental.cssChunking` to the [`StyleGroupsAlgorithm`] Turbopack should use.
 ///
 /// `strict` and `false` (`CssChunkingObject::None`) are bundler-incompatible with Turbopack and
@@ -1222,6 +1299,9 @@ pub struct ExperimentalConfig {
 
     /// CSS chunking strategy. See [`CssChunkingConfig`] for the accepted shapes.
     css_chunking: Option<CssChunkingConfig>,
+
+    /// Traffic-shape hints for the production chunker. See [`ChunkingHeuristicsConfig`].
+    chunking_heuristics: Option<ChunkingHeuristicsConfig>,
 
     // ---
     // UNSUPPORTED
@@ -2010,6 +2090,33 @@ impl NextConfig {
     #[turbo_tasks::function]
     pub fn css_chunking(&self) -> Result<Vc<StyleGroupsAlgorithm>> {
         Ok(resolve_css_chunking_algorithm(self.experimental.css_chunking.as_ref())?.cell())
+    }
+
+    #[turbo_tasks::function]
+    pub fn chunking_heuristics(&self) -> Result<Vc<ChunkingHeuristics>> {
+        let config = self.experimental.chunking_heuristics.as_ref();
+        let clusters = config
+            .and_then(|c| c.clusters.as_deref())
+            .unwrap_or_default()
+            .iter()
+            .map(|patterns| parse_route_globs(patterns))
+            .collect::<Result<Vec<_>>>()?;
+        let common_entry_points = parse_route_globs(
+            config
+                .and_then(|c| c.common_entry_points.as_deref())
+                .unwrap_or_default(),
+        )?;
+        Ok(ChunkingHeuristics {
+            clusters,
+            bounce_rate_percent: config
+                .and_then(|c| c.bounce_rate)
+                .map(|rate| (rate.clamp(0.0, 1.0) * 100.0).round() as u32),
+            common_entry_points,
+            estimated_request_cost: config
+                .and_then(|c| c.estimated_request_cost)
+                .map(|cost| cost.max(0.0).round() as u64),
+        }
+        .cell())
     }
 
     #[turbo_tasks::function]

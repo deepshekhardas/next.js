@@ -94,6 +94,36 @@ pub struct ChunkGroupInfo {
     #[turbo_tasks(trace_ignore)]
     #[bincode(with = "turbo_bincode::indexset")]
     pub chunk_group_keys: FxIndexSet<ChunkGroupKey>,
+    /// Chunking heuristics from `experimental.chunkingHeuristics`.
+    pub chunking_heuristics: ChunkingHeuristicsInfo,
+}
+
+/// Per-chunk-group version of `experimental.chunkingHeuristics`, computed by
+/// [`compute_chunk_group_info`]. The `clusters` and `common_entry_points` vectors are the
+/// same length and order of [`ChunkGroupInfo::chunk_groups`].
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    TraceRawVcs,
+    ValueDebugFormat,
+    NonLocalValue,
+    Encode,
+    Decode,
+)]
+pub struct ChunkingHeuristicsInfo {
+    pub bounce_rate_percent: Option<u32>,
+    pub estimated_request_cost: Option<u64>,
+    /// Cluster membership of each chunk group: the set of cluster indices (config order) the group
+    /// participates in. Entry chunk groups carry their route's clusters; derived chunk groups
+    /// inherit the union of clusters of the chunk groups that reference them.
+    #[turbo_tasks(trace_ignore)]
+    pub clusters: Vec<RoaringBitmapWrapper>,
+    /// Whether each chunk group serves a common entry point. Entry chunk groups carry their
+    /// route's flag; derived chunk groups inherit from the chunk groups that reference them.
+    pub common_entry_points: Vec<bool>,
 }
 
 #[turbo_tasks::value_impl]
@@ -126,11 +156,28 @@ impl ChunkGroupInfo {
     }
 }
 
+/// Per-entry chunking heuristics derived from `experimental.chunkingHeuristics`.
+#[turbo_tasks::task_input]
+#[derive(Debug, Default, Clone, Hash, PartialEq, Eq, TraceRawVcs, Encode, Decode)]
+pub struct EntryHeuristics {
+    /// Cluster indices (config order) this route belongs to.
+    pub clusters: Vec<u32>,
+    /// Whether this route is marked as a common entry point.
+    pub common_entry_point: bool,
+    /// The global `bounceRate` as an integer percentage (0..=100, so it can be an integer).
+    pub bounce_rate_percent: Option<u32>,
+    /// The global `estimatedRequestCost` in bytes.
+    pub estimated_request_cost: Option<u64>,
+}
+
 /// See [ChunkGroup] for documentation
 #[turbo_tasks::task_input]
 #[derive(Debug, Clone, Hash, PartialEq, Eq, TraceRawVcs, Encode, Decode)]
 pub enum ChunkGroupEntry {
-    Entry(Vec<ResolvedVc<Box<dyn Module>>>),
+    Entry {
+        modules: Vec<ResolvedVc<Box<dyn Module>>>,
+        heuristics: EntryHeuristics,
+    },
     Async(ResolvedVc<Box<dyn Module>>),
     Isolated(ResolvedVc<Box<dyn Module>>),
     IsolatedMerged {
@@ -152,7 +199,9 @@ impl ChunkGroupEntry {
             Self::Async(e) | Self::Isolated(e) | Self::Shared(e) => {
                 Either::Left(std::iter::once(*e))
             }
-            Self::Entry(entries)
+            Self::Entry {
+                modules: entries, ..
+            }
             | Self::IsolatedMerged { entries, .. }
             | Self::SharedMultiple(entries)
             | Self::SharedMerged { entries, .. } => Either::Right(entries.iter().copied()),
@@ -465,7 +514,7 @@ pub async fn compute_chunk_group_info(graph: &ModuleGraph) -> Result<Vc<ChunkGro
             >,
         ) -> ChunkGroupKey {
             match entry {
-                ChunkGroupEntry::Entry(entries) => ChunkGroupKey::Entry(entries),
+                ChunkGroupEntry::Entry { modules, .. } => ChunkGroupKey::Entry(modules),
                 ChunkGroupEntry::Async(entry) => ChunkGroupKey::Async(entry),
                 ChunkGroupEntry::Isolated(entry) => ChunkGroupKey::Isolated(entry),
                 ChunkGroupEntry::Shared(entry) => ChunkGroupKey::Shared(entry),
@@ -760,6 +809,7 @@ pub async fn compute_chunk_group_info(graph: &ModuleGraph) -> Result<Vc<ChunkGro
         Ok(ChunkGroupInfo {
             module_chunk_groups: ResolvedVc::cell(module_chunk_groups),
             chunk_group_keys: chunk_groups_map.keys().cloned().collect(),
+            chunking_heuristics: ChunkingHeuristicsInfo::default(),
             chunk_groups: chunk_groups_map
                 .into_iter()
                 .map(|(k, (_, merged_entries))| match k {
