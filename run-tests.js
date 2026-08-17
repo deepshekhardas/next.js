@@ -9,11 +9,11 @@ const { promisify } = require('util')
 const { Sema } = require('async-sema')
 const { spawn, exec: execOrig } = require('child_process')
 const { createNextInstall } = require('./test/lib/create-next-install')
+const { getBrowserLaunch } = require('./test/lib/browsers/launch')
 const glob = promisify(_glob)
 const exec = promisify(execOrig)
 const core = require('@actions/core')
 const { getTestFilter } = require('./test/get-test-filter')
-const { checkBuildFreshness } = require('./test/lib/check-build-freshness')
 
 // --- Test profile and result caching via actions cache ---
 // On CI retry attempts, skip tests that already passed on this commit.
@@ -40,6 +40,7 @@ class TestProfile {
     'NEXT_E2E_TEST_TIMEOUT',
     'NEXT_TURBOPACK_IO_CONCURRENCY',
     'NEXT_TEST_PASSED_FILE',
+    'NEXT_TEST_BROWSER_WS_ENDPOINT',
     'TURBO_TASKS_AVAILABLE_PARALLELISM',
   ])
 
@@ -298,6 +299,14 @@ ${output}
 
 let exiting = false
 
+/**
+ * Browser server shared across all test suites. Suites connect to it via
+ * `test/lib/browsers/playwright.ts` instead of each launching their own
+ * browser process.
+ * @type {import('playwright').BrowserServer | undefined}
+ */
+let sharedBrowserServer
+
 const cleanUpAndExit = async (code) => {
   if (exiting) {
     return
@@ -305,6 +314,11 @@ const cleanUpAndExit = async (code) => {
   exiting = true
   console.log(`exiting with code ${code}`)
 
+  if (sharedBrowserServer) {
+    await sharedBrowserServer.close().catch((err) => {
+      console.error('Failed to close shared browser server:', err)
+    })
+  }
   if (process.env.NEXT_TEST_STARTER) {
     await fsp.rm(process.env.NEXT_TEST_STARTER, {
       recursive: true,
@@ -344,9 +358,6 @@ async function getTestTimings() {
 async function main() {
   // Ensure we have the arguments awaited from yargs.
   argv = await argv
-
-  // Check for stale or missing build
-  await checkBuildFreshness()
 
   // `.github/workflows/build_reusable.yml` sets this, we should use it unless
   // it's overridden by an explicit `--concurrency` argument.
@@ -626,6 +637,24 @@ ${ENDGROUP}`)
     process.env.NEXT_TEST_PKG_PATHS = JSON.stringify(serializedPkgPaths)
     process.env.NEXT_TEST_STARTER = installDir
     console.log(`${ENDGROUP}`)
+  }
+
+  // best-effort, don't spawn a browser for unit tests, if we don't spawn a
+  // browser but should've, that's okay, `next-webdriver` will still set it up
+  if (
+    !options.dry &&
+    ((options.type && options.type !== 'unit') ||
+      tests.some((test) => !testFilters.unit.test(test.file)))
+  ) {
+    // Launch a single browser server shared by all test suites, instead of
+    // each suite launching its own browser process. Suites connect to it via
+    // the ws endpoint env var in `test/lib/browsers/playwright.ts`.
+    const { browserType, launchOptions } = getBrowserLaunch(
+      process.env.BROWSER_NAME || 'chrome',
+      { headless: true } // matches per-test env below
+    )
+    sharedBrowserServer = await browserType.launchServer(launchOptions)
+    process.env.NEXT_TEST_BROWSER_WS_ENDPOINT = sharedBrowserServer.wsEndpoint()
   }
 
   const sema = new Sema(options.concurrency, { capacity: tests.length })
